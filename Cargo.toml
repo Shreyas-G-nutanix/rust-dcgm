@@ -1,0 +1,15 @@
+[package]
+name = "rust-dcgm"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[build-dependencies]
+bindgen = "0.71.0"
+
+[dependencies]
+dlopen = "0.1.8"
+lazy_static = "1.5.0"
+libc = "0.2.175"
+libloading = "0.8.8"
+tracing = "0.1.41"

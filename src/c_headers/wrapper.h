@@ -1,0 +1,7 @@
+#include "dcgm_agent.h"
+#include "dcgm_api_export.h"
+#include "dcgm_errors.h"
+#include "dcgm_fields.h"
+//#include "dcgm_nvml.h"
+#include "dcgm_structs.h"
+//#include "nvml.h"
