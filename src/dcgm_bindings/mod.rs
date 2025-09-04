@@ -3,7 +3,7 @@
 #![allow(non_snake_case)]
 #![allow(unused)]
 
-mod bindings;
+pub mod bindings;
 use bindings::*;
 
 use std::ffi::{CString, CStr};
@@ -52,9 +52,9 @@ unsafe impl Sync for DcgmLib {}
 lazy_static! {
     static ref DCGM_LIB: Result<DcgmLib, DCGMError> = {
         let dcgm = unsafe {
-            DcgmLib::new("/lib64/libdcgm.so.4").map_err(|e| {
-                tracing::error!("Failed to load NVML library: {e}");
-                DCGMError::from("Failed to load NVML library")
+            DcgmLib::new("/usr/lib/x86_64-linux-gnu/libdcgm.so.4").map_err(|e| {
+                tracing::error!("Failed to load DCGM library: {e}");
+                DCGMError::from("Failed to load DCGM library")
             })?
         };
         Ok(dcgm)
@@ -128,7 +128,7 @@ impl DcgmLibSafe {
 
     pub fn connectStandalone(&mut self, args: &[&str]) -> Result<(), DCGMError>{
         if args.len() < 2 {
-            return Err(DCGMError::from("missing dcgm address and / or port"))
+            return Err(DCGMError::from("missing dcgm address and / or isUnixSocket"))
         } else{
             let mut connect_params =  bindings::dcgmConnectV2Params_t{
                 version: make_version2(std::mem::size_of::<bindings::dcgmConnectV2Params_t>() as u32),
@@ -232,7 +232,7 @@ impl DcgmLibSafe {
         }
     }
 
-    pub fn fieldGroupCreate(&mut self, fieldGroupName: &String, fieldIds: &mut [u16])-> Result<dcgmFieldGrp_t, DCGMError>{
+    pub fn fieldGroupCreate(&mut self, fieldGroupName: &str, fieldIds: &mut [u16])-> Result<dcgmFieldGrp_t, DCGMError>{
         let mut fieldHandle: dcgmFieldGrp_t = 0;
         match unsafe{self.dcgm.dcgmFieldGroupCreate(
             self.handle, fieldIds.len() as i32, 
@@ -269,6 +269,7 @@ impl DcgmLibSafe {
 
     pub fn entitiesGetLatestValues(&mut self, entities: &mut[dcgmGroupEntityPair_t], fields: &mut[u16], flags: u32) -> Result<Vec<dcgmFieldValue_v2>, DCGMError>{
         let mut values = Vec::<dcgmFieldValue_v2>::with_capacity(fields.len()*entities.len());
+         unsafe{values.set_len(fields.len()*entities.len());}
         match unsafe{self.dcgm.dcgmEntitiesGetLatestValues(
             self.handle, 
             &mut entities[0], 
@@ -283,7 +284,21 @@ impl DcgmLibSafe {
         }
     }
 
-    pub fn entityGetLatestValues(&mut self, )
+    pub fn entityGetLatestValues(&mut self, entityId: i32, entityGroup: dcgm_field_entity_group_t, fields: &mut[u16])->Result<Vec<dcgmFieldValue_v1>, DCGMError>{
+        let mut values = Vec::<dcgmFieldValue_v1>::with_capacity(fields.len());
+        unsafe{values.set_len(fields.len());}
+        match unsafe{self.dcgm.dcgmEntityGetLatestValues(
+            self.handle, 
+            entityGroup,
+            entityId, 
+            &mut fields[0],
+            fields.len() as c_uint,
+            &raw mut values[0])}{
+
+            dcgmReturn_enum_DCGM_ST_OK => Ok(values),
+            err_code => return Err(DCGMError::from(self.get_error_msg(err_code)))
+        }
+    }
 
     pub fn selectGpusByTopology(&mut self, gpuIds: &HashSet<u32>, numGpus: u32) -> Result<HashSet<u32>, DCGMError>{
         let mut gpuBitmask: u64 = 0;
@@ -360,7 +375,8 @@ impl DcgmLibSafe {
     pub fn getDeviceAttributes(&mut self, gpuId: u32) -> Result<dcgmDeviceAttributes_t, DCGMError>{
         unsafe{
             let mut device: dcgmDeviceAttributes_t = std::mem::MaybeUninit::uninit().assume_init();
-            match self.dcgm.dcgmGetDeviceAttributes(self.handle, gpuId, &mut device){
+            device.version = make_version3(std::mem::size_of::<dcgmDeviceAttributes_t>() as u32);
+            match self.dcgm.dcgmGetDeviceAttributes(self.handle, gpuId as c_uint, &mut device){
                 dcgmReturn_enum_DCGM_ST_OK => Ok(device),
                 err_code => return Err(DCGMError::from(self.get_error_msg(err_code)))
             }
@@ -370,11 +386,13 @@ impl DcgmLibSafe {
     pub fn getDeviceTopology(&mut self, gpuId: u32) -> Result<Vec<P2PLink>, DCGMError>{
         unsafe{
             let mut topology: dcgmDeviceTopology_t = std::mem::MaybeUninit::uninit().assume_init();
-            match self.dcgm.dcgmGetDeviceTopology(self.handle, gpuId, &mut topology){
+            topology.version = make_version1(std::mem::size_of::<dcgmDeviceTopology_t>() as u32);
+            match self.dcgm.dcgmGetDeviceTopology(self.handle, gpuId as c_uint, &mut topology){
                 dcgmReturn_enum_DCGM_ST_OK => (),
+                dcgmReturn_enum_DCGM_ST_NOT_SUPPORTED => return Ok(Vec::<P2PLink>::new()),
                 err_code => return Err(DCGMError::from(self.get_error_msg(err_code)))
             };
-            let device = self.getDeviceAttributes(gpuId)?;
+            let device = self.getDeviceAttributes(gpuId).unwrap();
             let mut links = Vec::<P2PLink>::with_capacity(topology.numGpus as usize);
             for i in 0..topology.numGpus{
                 let link = P2PLink{
@@ -399,17 +417,76 @@ pub fn dereference_field_value_v2(fv: &dcgmFieldValue_v2) -> Result<String, DCGM
     return Ok("a".to_string());
 }
 
+pub fn field_entity_group_to_string(g: dcgm_field_entity_group_t) -> String{
+    match g{
+        dcgm_field_entity_group_t_DCGM_FE_GPU => "GPU".to_string(),
+        dcgm_field_entity_group_t_DCGM_FE_SWITCH => "SWITCH".to_string(),
+        dcgm_field_entity_group_t_DCGM_FE_CONNECTX => "NIC".to_string(),
+        dcgm_field_entity_group_t_DCGM_FE_VGPU => "VGPU".to_string(),
+        _ => "N/A".to_string()
+    }
+}
+
+pub fn nvlink_state_to_string(link: dcgmNvLinkLinkState_t)-> String{
+    match link{
+        dcgmNvLinkLinkState_enum_DcgmNvLinkLinkStateNotSupported => "NOT SUPPORTED".to_string(),
+        dcgmNvLinkLinkState_enum_DcgmNvLinkLinkStateDisabled => "DISABLED".to_string(),
+        dcgmNvLinkLinkState_enum_DcgmNvLinkLinkStateDown => "DOWN".to_string(),
+        dcgmNvLinkLinkState_enum_DcgmNvLinkLinkStateUp => "UP".to_string(),
+        _ => "ERR: UNKNOWN".to_string()
+    }
+}
+
 pub struct NvLinkStatus{
-    parent_id: u32,
-    parent_type: dcgm_field_entity_group_t,
-    state: dcgmNvLinkLinkState_t,
-    index: u32,
+    pub parent_id: u32,
+    pub parent_type: dcgm_field_entity_group_t,
+    pub state: dcgmNvLinkLinkState_t,
+    pub index: u32,
 }
 
 pub struct P2PLink{
-    gpu: u32,
-    bus_id: String,
-    link: dcgmGpuLevel_enum
+    pub gpu: u32,
+    pub bus_id: String,
+    pub link: dcgmGpuLevel_enum
+}
+
+pub fn p2p_pcie_connectivity_to_string(mut link: dcgmGpuLevel_enum) -> String{
+    link &= 0xFF;
+    match link{
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_UNINITIALIZED => "N/A".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_BOARD => "PSB".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_SINGLE => "PIX".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_MULTIPLE => "PXB".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_HOSTBRIDGE => "PHB".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_CPU => "NODE".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_SYSTEM => "SYS".to_string(),
+        _ => "ERR".to_string()
+    }
+}
+
+pub fn p2p_nvlink_connectivity_to_string(mut link: dcgmGpuLevel_enum) -> String{
+    link &= 0xFFFFFF00;
+    match link{
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK1 => "NV1".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK2 => "NV2".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK3 => "NV3".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK4 => "NV4".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK5 => "NV5".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK6 => "NV6".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK7 => "NV7".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK8 => "NV8".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK9 => "NV9".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK10 => "NV10".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK11 => "NV11".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK12 => "NV12".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK13 => "NV13".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK14 => "NV14".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK15 => "NV15".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK16 => "NV16".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK17 => "NV17".to_string(),
+        dcgmGpuLevel_enum_DCGM_TOPOLOGY_NVLINK18 => "NV18".to_string(),
+        _ => "ERR".to_string()
+    }
 }
 
 fn make_version1(struct_type: u32) -> u32 {
@@ -418,6 +495,10 @@ fn make_version1(struct_type: u32) -> u32 {
 
 fn make_version2(struct_type: u32) -> u32 {
     struct_type | (2 << 24)
+}
+
+fn make_version3(struct_type: u32) -> u32 {
+    struct_type | (3 << 24)
 }
 
 fn make_version4(struct_type: u32) -> u32 {
